@@ -1,0 +1,4 @@
+pyrofork>=2.3.45
+# tgcrypto>=1.2.5  # Optional C-extension; requires MSVC C++ Build Tools on Windows
+aiohttp>=3.10
+python-dotenv>=1.0

@@ -1,0 +1,402 @@
+================================================================================
+ ZERO-DOWNLOAD TELEGRAM VIDEO METADATA BOT  -  REFERENCE GUIDE
+================================================================================
+Files:  config.py  bot.py  requirements.txt  .env.example  mediainfo_bot_guide.txt
+
+CONTENTS
+  1. Theory: why nothing is downloaded, and MTProto 1 MiB chunk alignment
+  2. Deployment (virtualenv / Windows PowerShell, systemd, Docker)
+  3. .env configuration template
+  4. Security audit matrix
+  5. Sample MediaInfo report
+  6. FAQ (4 GB Premium sessions, troubleshooting)
+  7. Features, commands and Telegraph output (v2)
+
+
+--------------------------------------------------------------------------------
+1. THEORY AND MATHEMATICS
+--------------------------------------------------------------------------------
+1.1 Where metadata lives
+  MP4/MOV   'moov' atom: at byte 0 (FastStart) or at EOF (typical recorder output).
+  MKV/WebM  EBML header, SeekHead, Info, Tracks: near the start of the file.
+  AVI       RIFF 'hdrl' list: first ~64 KiB.
+  The payload ('mdat' / Clusters) is >99.8% of the file and is never read.
+
+1.2 The bridge
+  Telegram file  --(MTProto, 1 MiB chunks)-->  Source.read_range()
+                 --(HTTP 206, 127.0.0.1)----->  aiohttp loopback server
+                 --(http://127.0.0.1:PORT/stream/TOKEN)--> ffprobe (subprocess)
+
+  ffprobe only knows it is reading an ordinary HTTP URL that supports Range.
+  It seeks like a normal player; every seek becomes a new Range request that the
+  bot answers by fetching only the needed chunks.
+
+1.3 Chunk alignment mathematics
+  Let C = 1,048,576 (1 MiB) and a request Range: bytes=start-end (inclusive).
+
+      start_chunk     = floor(start / C)
+      end_chunk       = floor(end   / C)
+      chunks_to_fetch = end_chunk - start_chunk + 1
+
+  Pyrogram/Pyrofork: client.stream_media(message, offset=start_chunk,
+                                         limit=chunks_to_fetch)
+  (offset and limit are in CHUNKS, not bytes.)
+
+  For chunk index i (start_chunk <= i <= end_chunk), with chunk bytes chunk_i:
+
+      slice_start = max(0, start - i*C)
+      slice_end   = min(len(chunk_i), end - i*C + 1)
+      emit chunk_i[slice_start:slice_end]
+
+  Worked example: Range bytes=1048570-1048600
+      start_chunk = 0, end_chunk = 1, chunks_to_fetch = 2
+      i=0: slice_start = 1048570
+           slice_end   = min(1048576, 1048600-0+1) = 1048576
+           emits bytes 1048570..1048575 (6 bytes)
+      i=1: slice_start = max(0, 1048570-1048576) = 0
+           slice_end = min(len, 1048600-1048576+1) = 25
+           emits bytes 0..24 of chunk 1 (25 bytes)
+      total = 31 bytes = (end - start + 1). Verified by unit test.
+
+  Open-ended / full-file ranges (bytes=0-) are streamed lazily: chunks are only
+  pulled as the socket drains, and the generator is closed the instant ffprobe
+  disconnects, so no further chunks are fetched.
+
+1.3 Bandwidth example (4 GB file, moov at EOF)
+  ffprobe reads ~32 KB at start, sees 'mdat', seeks to EOF, reads the last chunk.
+  Bandwidth: 1-3 MiB of 4096 MiB (< 0.1%), 0 bytes written to disk. Note the
+  granularity is 1 MiB, so even a tiny read costs one whole chunk.
+
+
+--------------------------------------------------------------------------------
+2. DEPLOYMENT
+--------------------------------------------------------------------------------
+Prerequisites: Python 3.11+ (3.12 recommended), FFmpeg (provides ffprobe),
+               API ID/HASH from https://my.telegram.org, bot token from @BotFather.
+
+2.1 Local virtualenv - Linux / macOS
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    cp .env.example .env        # then edit .env
+    python bot.py
+
+2.1b Local virtualenv - Windows PowerShell
+    py -3.12 -m venv .venv
+    .\.venv\Scripts\Activate.ps1
+    pip install -r requirements.txt
+    Copy-Item .env.example .env       # then edit .env
+    winget install Gyan.FFmpeg        # or download from ffmpeg.org; ensure ffprobe is on PATH
+    ffprobe -version                  # verify
+    python bot.py
+  (If activation is blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned)
+
+2.2 Linux systemd service  (/etc/systemd/system/mediainfo-bot.service)
+    [Unit]
+    Description=Zero-Download MediaInfo Telegram Bot
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    User=mediainfo
+    WorkingDirectory=/opt/mediainfo-bot
+    EnvironmentFile=/opt/mediainfo-bot/.env
+    ExecStart=/opt/mediainfo-bot/.venv/bin/python bot.py
+    Restart=on-failure
+    RestartSec=5
+    NoNewPrivileges=true
+    PrivateTmp=true
+    ProtectSystem=strict
+    ProtectHome=true
+
+    [Install]
+    WantedBy=multi-user.target
+
+  Commands:
+    sudo useradd -r -s /usr/sbin/nologin mediainfo
+    sudo chown -R mediainfo: /opt/mediainfo-bot && sudo chmod 600 /opt/mediainfo-bot/.env
+    sudo systemctl daemon-reload && sudo systemctl enable --now mediainfo-bot
+    journalctl -u mediainfo-bot -f
+
+2.3 Dockerfile
+    FROM python:3.12-slim
+    RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+        && rm -rf /var/lib/apt/lists/*
+    RUN useradd -r -u 10001 bot
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+    COPY config.py bot.py ./
+    USER bot
+    CMD ["python", "bot.py"]
+
+    docker build -t mediainfo-bot .
+    docker run -d --name mediainfo-bot --restart unless-stopped \
+        --env-file .env --read-only --tmpfs /tmp mediainfo-bot
+  (The loopback server is inside the container; no ports need publishing.)
+
+
+--------------------------------------------------------------------------------
+3. .env TEMPLATE  (same content as .env.example)
+--------------------------------------------------------------------------------
+    TELEGRAM_API_ID=1234567
+    TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+    TELEGRAM_BOT_TOKEN=123456789:AAExampleBotTokenFromBotFather
+    TELEGRAM_USER_SESSION_STRING=
+    OWNER_ID=
+    ALLOWED_USERS=
+    STREAM_HOST=127.0.0.1
+    STREAM_PORT=0
+    FFPROBE_BIN=ffprobe
+    PROBE_TIMEOUT_SECONDS=30.0
+    FFPROBE_PROBESIZE=5000000
+    FFPROBE_ANALYZEDURATION=5000000
+    MAX_CONCURRENT_PROBES=10
+    RATE_LIMIT_BURST=3.0
+    RATE_LIMIT_REFILL_RATE=0.2
+    OUTPUT_MODE=telegraph
+    TELEGRAPH_ACCESS_TOKEN=
+    TELEGRAPH_AUTHOR=MediaInfo Bot
+    TELEGRAPH_DOMAIN=graph.org
+    CACHE_TTL_SECONDS=3600
+    CACHE_MAX_ENTRIES=500
+
+  ALLOWED_USERS accepts comma/space separated Telegram user IDs.
+  Access: if OWNER_ID and ALLOWED_USERS are both empty the bot is PUBLIC;
+  otherwise only OWNER_ID and ALLOWED_USERS may use it.
+
+
+--------------------------------------------------------------------------------
+4. SECURITY AUDIT MATRIX
+--------------------------------------------------------------------------------
+Threat                     | Mitigation                                         | Where
+---------------------------|----------------------------------------------------|----------
+Command injection          | asyncio.create_subprocess_exec, argv list, no      | run_ffprobe
+                           | shell; operand after '--'; argv holds only the     |
+                           | bot-generated loopback URL, never user text        |
+SSRF (direct)              | Scheme allowlist, no URL credentials, literal-IP   | validate_url_
+                           | check vs BLOCKED_NETWORKS (RFC1918, loopback,      | syntax
+                           | link-local/IMDS 169.254/16, CGNAT, ULA fc00::/7,   |
+                           | fe80::/10, ::1, IPv4-mapped/6to4 unwrapped)        |
+SSRF (DNS rebinding /      | Remote links are fetched by the BOT through an     | SafeResolver
+TOCTOU)                    | aiohttp client whose resolver drops bogon answers  |
+                           | at connect time; ffprobe never resolves the host   |
+SSRF (redirects)           | Manual redirect loop (max 3); every hop is         | HttpSource.
+                           | re-validated                                       | _open
+DNS rebinding on the       | Host header must be 127.0.0.1:PORT or              | StreamServer.
+local proxy                | localhost:PORT, else 403                           | _handle
+Token guessing / leakage   | secrets.token_urlsafe(32) = 256 bits; compared     | _lookup
+                           | with hmac.compare_digest over all sessions;        |
+                           | token exists only for the life of one inspection   |
+                           | (unregistered in finally); loopback bind only      |
+Other local users hitting  | Port is random per run; unguessable token needed   | -
+the proxy                  |                                                    |
+Denial of service          | Per-user token bucket (burst 3, 0.2/s); global     | TokenBucket,
+                           | Semaphore (MAX_CONCURRENT_PROBES); hard ffprobe    | Semaphore
+                           | timeout with process-TREE kill; probesize and      |
+                           | analyzeduration capped                             |
+Memory exhaustion          | Never buffers a file: <=64 KiB socket writes with  | _handle
+                           | awaited drain; report built from JSON only         |
+Protocol abuse via ffprobe | -protocol_whitelist file,crypto,data,http,https,   | run_ffprobe
+                           | tcp,tls (no concat:, subfile:, etc.)               |
+Range-less servers         | Refused (would require full download)              | probe_size
+Secrets hygiene            | Credentials only from env/.env (chmod 600);       | config.py
+                           | in_memory Pyrogram sessions; never logged          |
+Disk footprint             | Report sent from BytesIO; nothing written to disk  | _deliver
+Report privacy (Telegraph) | telegra.ph pages are PUBLIC to anyone holding the  | Telegraph
+                           | link. They contain only metadata (incl. file      |
+                           | name), never file content. Use OUTPUT_MODE=txt for |
+                           | sensitive names                                    |
+Group spam                 | Bot reacts only to /mediainfo, /ml, /mi; plain     | on_mi
+                           | media/text is ignored everywhere                   |
+
+Residual notes
+  - A Premium USER session string grants full account access. Treat it as a
+    password, use a dedicated account, never commit it.
+  - Public mode lets anyone make the bot fetch public URLs; set OWNER_ID /
+    ALLOWED_USERS for private deployments.
+
+
+--------------------------------------------------------------------------------
+5. SAMPLE REPORT  (illustrative: a 4.37 GiB MKV)
+--------------------------------------------------------------------------------
+General
+Complete name                            : Example.Movie.2160p.HDR.x265.mkv
+Format                                   : Matroska
+Format profile                           : Version 4
+File size                                : 4.37 GiB
+Duration                                 : 2 h 11 min
+Overall bit rate                         : 4 765 kb/s
+Frame rate                               : 23.976 FPS
+Encoded date                             : 2025-03-14T09:22:41.000000Z
+Writing application                      : mkvmerge v81.0
+Number of streams                        : 5
+Source                                   : Telegram MTProto range streaming (Premium user session)
+
+Video
+ID                                       : 1
+Format                                   : HEVC
+Format/Info                              : H.265 / HEVC (High Efficiency Video Coding)
+Format profile                           : Main 10
+Duration                                 : 2 h 11 min
+Bit rate                                 : 4 100 kb/s
+Width                                    : 3840 pixels
+Height                                   : 1600 pixels
+Display aspect ratio                     : 2.400:1
+Frame rate                               : 23.976 FPS
+Color space                              : YUV
+Chroma subsampling                       : 4:2:0
+Bit depth                                : 10 bits
+Scan type                                : Progressive
+Color range                              : Tv
+Color primaries                          : BT.2020
+Transfer characteristics                 : PQ (SMPTE ST 2084)
+Matrix coefficients                      : BT.2020 non-constant
+HDR format                               : SMPTE ST 2084, HDR10 compatible
+Language                                 : English
+Default                                  : Yes
+Forced                                   : No
+
+Audio #1
+ID                                       : 2
+Format                                   : E-AC-3
+Format/Info                              : ATSC A/52B (AC-3, E-AC-3)
+Duration                                 : 2 h 11 min
+Bit rate                                 : 640 kb/s
+Channel(s)                               : 6 channels
+Channel layout                           : 5.1(side)
+Sampling rate                            : 48 kHz
+Language                                 : English
+Default                                  : Yes
+Forced                                   : No
+
+Audio #2
+ID                                       : 3
+Format                                   : AAC
+Format profile                           : LC
+Bit rate                                 : 128 kb/s
+Channel(s)                               : 2 channels
+Channel layout                           : stereo
+Sampling rate                            : 48 kHz
+Language                                 : Hindi
+Default                                  : No
+Forced                                   : No
+
+Text #1
+ID                                       : 4
+Format                                   : SubRip
+Title                                    : English SDH
+Language                                 : English
+Default                                  : Yes
+Forced                                   : No
+
+Text #2
+ID                                       : 5
+Format                                   : SubRip
+Language                                 : Hindi
+Default                                  : No
+Forced                                   : No
+
+Menu
+00:00:00.000                             : Opening
+00:12:41.250                             : Chapter 2
+01:58:03.500                             : End Credits
+
+Data Transferred
+Data transferred                         : 2.00 MiB
+Total file size                          : 4.37 GiB
+Bandwidth saved                          : 99.955 %
+Bytes written to disk                    : 0 bytes
+
+
+--------------------------------------------------------------------------------
+6. FAQ AND TROUBLESHOOTING
+--------------------------------------------------------------------------------
+Q: Why do I need a user session for 4 GB files?
+A: Bot accounts are limited to 2 GB; Telegram Premium raises the limit to 4 GB
+   for user accounts. Set TELEGRAM_USER_SESSION_STRING to a Premium account's
+   Pyrogram session string. For files larger than 2 GiB the bot asks the user
+   session to fetch the same message (user.get_messages(chat_id, message_id)).
+
+Q: The user session can't see my file. What now?
+A: A user account can only read messages in chats it belongs to. In a private
+   chat with the BOT the Premium account is not a participant, so the bot falls
+   back to its own client (which may fail for >2 GB). Fix: send/forward the file
+   to a group or channel that BOTH the bot and the Premium account have joined.
+
+Q: How do I generate a session string?
+A: Run a one-off script with Pyrogram/Pyrofork:
+       from pyrogram import Client
+       with Client("gen", api_id=ID, api_hash=HASH, in_memory=True) as app:
+           print(app.export_session_string())
+   Log in with the Premium account's phone number, then store the string in .env.
+
+Q: "ffprobe was not found".
+A: Install FFmpeg and ensure ffprobe is on PATH, or set FFPROBE_BIN to its
+   absolute path (Windows: C:\ffmpeg\bin\ffprobe.exe).
+
+Q: "moov atom missing" / "could not recognise this as a valid container".
+A: The upload was truncated, the file is corrupt/encrypted, or it is not a
+   video. Re-upload the original.
+
+Q: "Inspection timed out".
+A: Slow datacenter or very large header. Raise PROBE_TIMEOUT_SECONDS (e.g. 60)
+   or FFPROBE_PROBESIZE. MKVs with huge attachment/cue tables need more.
+
+Q: External link rejected: "does not support HTTP Range requests".
+A: By design. Without byte-range support the file cannot be inspected without
+   downloading it, which this bot refuses to do.
+
+Q: Link rejected as private/internal.
+A: The host resolves to a loopback/RFC1918/link-local/metadata address. This is
+   the SSRF guard and cannot be disabled via configuration.
+
+Q: Log lines about ConnectionResetError / BrokenPipe?
+A: These are suppressed on purpose: ffprobe closes the socket as soon as it has
+   what it needs.
+
+Q: "Missing required configuration".
+A: TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN are mandatory.
+
+Q: Windows: process tree is not killed on timeout?
+A: bot.py uses 'taskkill /F /T /PID'; run the bot from a normal (non-restricted)
+   shell and make sure taskkill.exe is available (default on Windows).
+
+
+--------------------------------------------------------------------------------
+7. FEATURES, COMMANDS AND TELEGRAPH OUTPUT (v2)
+--------------------------------------------------------------------------------
+7.1 MediaInfo as a link
+  The full report is published to telegra.ph and returned as a link plus an
+  inline "Full MediaInfo" button under a short summary.
+  OUTPUT_MODE=telegraph  link only (automatic .txt fallback if Telegraph fails)
+  OUTPUT_MODE=txt        .txt document only
+  OUTPUT_MODE=both       link and .txt
+  - One Telegraph account is auto-created on first use. To keep all pages under
+    one account across restarts, put its access_token in TELEGRAPH_ACCESS_TOKEN.
+  - Telegraph pages are limited to ~64 KB; huge reports are trimmed (chapters
+    first, then trailing subtitle tracks) with a note on the page.
+  - Telegraph must be reachable from the bot's server (api.telegra.ph).
+
+7.2 Commands (v3: command-only)
+  /mediainfo | /ml | /mi   reply to a video/audio file, or to a message with a link
+  /mediainfo <link>        inspect a direct http(s) link
+  (caption)                send a file with /mediainfo as its caption
+  /start, /help            help text
+  /stats                   owner only: uptime, inspections, cache hits, failures
+
+7.3 Behaviour
+  - NOTHING is automatic. Sending a file or a link without a command gets no
+    reply and triggers no inspection, in private chats and groups alike.
+  - The report is a graph.org link (Telegraph page). It opens inside Telegram
+    (Instant View) or any browser - no download needed. Change the domain with
+    TELEGRAPH_DOMAIN (graph.org or telegra.ph).
+  - No .txt file is ever sent unless OUTPUT_MODE=txt/both or TXT_FALLBACK=true.
+    If Telegraph fails the bot replies with the error reason. API hosts are tried in
+    order (TELEGRAPH_API_URLS) with retries; a stale TELEGRAPH_ACCESS_TOKEN is replaced.
+  - Audio files are supported (mp3, flac, m4a, aac, opus, ogg, wav, mka, ...).
+  - Result cache: the same Telegram file or link within CACHE_TTL_SECONDS returns
+    instantly with the same link and no new network reads. Link inputs still pass
+    the SSRF check before the cache.
+================================================================================
